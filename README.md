@@ -1,4 +1,3 @@
-````md
 # 🌐 Multi-threaded Web Crawler Simulation (OS Project)
 
 ## 📘 Course Information
@@ -78,7 +77,6 @@ Used for performing real HTTP requests and downloading web page content.
 #### Installation:
 ```bash
 sudo apt install libcurl4-openssl-dev
-````
 
 ## ▶️ How to Compile & Run
 
