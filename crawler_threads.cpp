@@ -1,8 +1,3 @@
-/**
- * Project: Parallel Web Search Crawler
- * Final Stats Summary Block Added
- */
-
 #include <iostream>
 #include <queue>
 #include <unordered_set>
