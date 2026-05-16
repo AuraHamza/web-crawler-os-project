@@ -14,225 +14,354 @@
 
 using namespace std;
 
-// Task Structure
-struct Task {
+struct task {
     string url;
     int depth;
 };
 
-// --- Shared Resources ---
-queue<Task> urlFrontier;
-unordered_set<string> visitedURLs;
-unordered_map<string, vector<string>> keywordIndex;
+queue<task> url_queue;
+unordered_set<string> visited_urls;
+unordered_map<string, vector<string>> keyword_index;
 
-// --- Synchronization Primitives ---
-pthread_mutex_t queueLock = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t visitedLock = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t statsLock = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t indexLock = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t queueCond = PTHREAD_COND_INITIALIZER; 
-sem_t threadLimitSem;
+pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t visited_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t index_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+sem_t thread_limit;
 
-// --- Stats & State ---
-int MAX_THREADS = 4;
-int MAX_DEPTH = 2;
-int pagesCrawled = 0;
-int urlsDiscovered = 0;
-int fetchErrors = 0;
-int activeThreads = 0;
-bool crawlActive = true;
-chrono::steady_clock::time_point startTime;
+int max_threads = 4;
+int max_depth = 2;
+int pages_crawled = 0;
+int urls_found = 0;
+int fetch_errors = 0;
+int active_threads = 0;
+bool crawl_active = true;
 
-// --- URL Resolution ---
-string resolveURL(string baseUrl, string relUrl) {
-    if (relUrl.find("http") == 0) return relUrl;
-    if (relUrl.empty() || relUrl[0] == '#') return "";
-    size_t pos = baseUrl.find("/", 8);
-    string domain = (pos == string::npos) ? baseUrl : baseUrl.substr(0, pos);
-    if (relUrl[0] == '/') return domain + relUrl;
-    return domain + "/" + relUrl;
+chrono::steady_clock::time_point start_time;
+
+string resolve_url(string base_url, string relative_url) {
+    if (relative_url.find("http") == 0)
+        return relative_url;
+
+    if (relative_url.empty() || relative_url[0] == '#')
+        return "";
+
+    size_t pos = base_url.find("/", 8);
+    string domain = (pos == string::npos) ? base_url : base_url.substr(0, pos);
+
+    if (relative_url[0] == '/')
+        return domain + relative_url;
+
+    return domain + "/" + relative_url;
 }
 
-size_t writeCallback(void* contents, size_t size, size_t nmemb, string* output) {
+size_t write_callback(void* contents, size_t size, size_t nmemb, string* output) {
     output->append((char*)contents, size * nmemb);
     return size * nmemb;
 }
 
-string fetchPage(string url) {
+string fetch_page(string url) {
     CURL* curl = curl_easy_init();
-    string buffer;
+    string html;
+
     if (curl) {
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &html);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L);
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
-        CURLcode res = curl_easy_perform(curl);
+        curl_easy_setopt(curl, CURLOPT_USERAGENT,
+                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+
+        CURLcode result = curl_easy_perform(curl);
         curl_easy_cleanup(curl);
-        if (res != CURLE_OK) return "";
+
+        if (result != CURLE_OK)
+            return "";
     }
-    return buffer;
+
+    return html;
 }
 
-void processContent(string html, string baseUrl, int depth) {
-    regex urlRegex("href=['\"]([^'\"]+)['\"]");
-    auto urlBegin = sregex_iterator(html.begin(), html.end(), urlRegex);
-    auto urlEnd = sregex_iterator();
-    for (sregex_iterator i = urlBegin; i != urlEnd; ++i) {
-        string fullUrl = resolveURL(baseUrl, (*i)[1].str());
-        if (!fullUrl.empty()) {
-            pthread_mutex_lock(&queueLock);
-            pthread_mutex_lock(&visitedLock);
-            if (visitedURLs.find(fullUrl) == visitedURLs.end() && depth < MAX_DEPTH) {
-                urlFrontier.push({fullUrl, depth + 1});
-                visitedURLs.insert(fullUrl);
-                pthread_cond_signal(&queueCond);
-                pthread_mutex_lock(&statsLock);
-                urlsDiscovered++;
-                pthread_mutex_unlock(&statsLock);
+void process_content(string html, string base_url, int depth) {
+    regex link_pattern("href=['\"]([^'\"]+)['\"]");
+    auto link_begin = sregex_iterator(html.begin(), html.end(), link_pattern);
+    auto link_end = sregex_iterator();
+
+    for (sregex_iterator i = link_begin; i != link_end; ++i) {
+        string full_url = resolve_url(base_url, (*i)[1].str());
+
+        if (!full_url.empty()) {
+            pthread_mutex_lock(&queue_lock);
+            pthread_mutex_lock(&visited_lock);
+
+            if (visited_urls.find(full_url) == visited_urls.end() &&
+                depth < max_depth) {
+                url_queue.push({full_url, depth + 1});
+                visited_urls.insert(full_url);
+
+                pthread_cond_signal(&queue_cond);
+
+                pthread_mutex_lock(&stats_lock);
+                urls_found++;
+                pthread_mutex_unlock(&stats_lock);
             }
-            pthread_mutex_unlock(&visitedLock);
-            pthread_mutex_unlock(&queueLock);
+
+            pthread_mutex_unlock(&visited_lock);
+            pthread_mutex_unlock(&queue_lock);
         }
     }
-    regex wordRegex("\\b[a-zA-Z]{4,15}\\b");
-    auto wordBegin = sregex_iterator(html.begin(), html.end(), wordRegex);
-    for (sregex_iterator i = wordBegin; i != urlEnd; ++i) {
-        pthread_mutex_lock(&indexLock);
-        keywordIndex[(*i).str()].push_back(baseUrl);
-        pthread_mutex_unlock(&indexLock);
+
+    regex word_pattern("\\b[a-zA-Z]{4,15}\\b");
+    auto word_begin = sregex_iterator(html.begin(), html.end(), word_pattern);
+
+    for (sregex_iterator i = word_begin; i != link_end; ++i) {
+        pthread_mutex_lock(&index_lock);
+        keyword_index[(*i).str()].push_back(base_url);
+        pthread_mutex_unlock(&index_lock);
     }
 }
 
-void* monitorWorker(void* arg) {
+void* monitor_worker(void* arg) {
     (void)arg;
-    while (crawlActive) {
+
+    while (crawl_active) {
         sleep(1);
-        pthread_mutex_lock(&statsLock);
+
+        pthread_mutex_lock(&stats_lock);
+
         auto now = chrono::steady_clock::now();
-        chrono::duration<double> diff = now - startTime;
-        cout << "\r[Monitor] Pages: " << pagesCrawled << " | Active Threads: " << activeThreads << " | Time: " << (int)diff.count() << "s" << flush;
-        pthread_mutex_unlock(&statsLock);
+        chrono::duration<double> elapsed = now - start_time;
+
+        cout << "\r[Monitor] Pages: " << pages_crawled
+             << " | Active Threads: " << active_threads
+             << " | Time: " << (int)elapsed.count() << "s"
+             << flush;
+
+        pthread_mutex_unlock(&stats_lock);
     }
+
     return NULL;
 }
 
-void* crawlerWorker(void* arg) {
+void* crawler_worker(void* arg) {
     (void)arg;
+
     while (true) {
-        pthread_mutex_lock(&queueLock);
-        while (urlFrontier.empty() && crawlActive) {
-            pthread_cond_wait(&queueCond, &queueLock);
+        pthread_mutex_lock(&queue_lock);
+
+        while (url_queue.empty() && crawl_active) {
+            pthread_cond_wait(&queue_cond, &queue_lock);
         }
-        if (!crawlActive && urlFrontier.empty()) {
-            pthread_mutex_unlock(&queueLock);
+
+        if (!crawl_active && url_queue.empty()) {
+            pthread_mutex_unlock(&queue_lock);
             break;
         }
-        Task task = urlFrontier.front();
-        urlFrontier.pop();
-        pthread_mutex_unlock(&queueLock);
 
-        sem_wait(&threadLimitSem);
-        pthread_mutex_lock(&statsLock);
-        activeThreads++;
-        pthread_mutex_unlock(&statsLock);
+        task current_task = url_queue.front();
+        url_queue.pop();
 
-        string content = fetchPage(task.url);
+        pthread_mutex_unlock(&queue_lock);
 
-        pthread_mutex_lock(&statsLock);
-        if (content.empty()) fetchErrors++;
-        else pagesCrawled++;
-        activeThreads--;
-        pthread_mutex_unlock(&statsLock);
+        sem_wait(&thread_limit);
 
-        if (!content.empty()) processContent(content, task.url, task.depth);
-        sem_post(&threadLimitSem);
+        pthread_mutex_lock(&stats_lock);
+        active_threads++;
+        pthread_mutex_unlock(&stats_lock);
+
+        string page_content = fetch_page(current_task.url);
+
+        pthread_mutex_lock(&stats_lock);
+
+        if (page_content.empty())
+            fetch_errors++;
+        else
+            pages_crawled++;
+
+        active_threads--;
+
+        pthread_mutex_unlock(&stats_lock);
+
+        if (!page_content.empty()) {
+            process_content(page_content,
+                            current_task.url,
+                            current_task.depth);
+        }
+
+        sem_post(&thread_limit);
     }
+
     return NULL;
 }
 
-void resetCrawlerState(int threads) {
-    pthread_mutex_lock(&queueLock);
-    while(!urlFrontier.empty()) urlFrontier.pop();
-    pthread_mutex_unlock(&queueLock);
-    
-    pthread_mutex_lock(&visitedLock);
-    visitedURLs.clear();
-    pthread_mutex_unlock(&visitedLock);
-    
-    pthread_mutex_lock(&indexLock);
-    keywordIndex.clear();
-    pthread_mutex_unlock(&indexLock);
-    
-    pthread_mutex_lock(&statsLock);
-    pagesCrawled = 0; urlsDiscovered = 0; fetchErrors = 0; activeThreads = 0;
-    crawlActive = true;
-    MAX_THREADS = threads;
-    startTime = chrono::steady_clock::now();
-    pthread_mutex_unlock(&statsLock);
+void reset_crawler(int threads) {
+    pthread_mutex_lock(&queue_lock);
 
-    sem_destroy(&threadLimitSem);
-    sem_init(&threadLimitSem, 0, MAX_THREADS);
+    while (!url_queue.empty())
+        url_queue.pop();
+
+    pthread_mutex_unlock(&queue_lock);
+
+    pthread_mutex_lock(&visited_lock);
+    visited_urls.clear();
+    pthread_mutex_unlock(&visited_lock);
+
+    pthread_mutex_lock(&index_lock);
+    keyword_index.clear();
+    pthread_mutex_unlock(&index_lock);
+
+    pthread_mutex_lock(&stats_lock);
+
+    pages_crawled = 0;
+    urls_found = 0;
+    fetch_errors = 0;
+    active_threads = 0;
+    crawl_active = true;
+    max_threads = threads;
+    start_time = chrono::steady_clock::now();
+
+    pthread_mutex_unlock(&stats_lock);
+
+    sem_destroy(&thread_limit);
+    sem_init(&thread_limit, 0, max_threads);
 }
 
 int main(int argc, char* argv[]) {
-    int requestedThreads = (argc > 1) ? atoi(argv[1]) : 4;
+    int requested_threads = (argc > 1) ? atoi(argv[1]) : 4;
+
     curl_global_init(CURL_GLOBAL_ALL);
 
-    // PHASE 1
     cout << "\n--- Phase 1: Single-Threaded Test (5s) ---" << endl;
-    resetCrawlerState(1);
-    urlFrontier.push({"http://example.com", 0}); 
-    pthread_t st;
-    pthread_create(&st, NULL, crawlerWorker, NULL);
+
+    reset_crawler(1);
+
+    url_queue.push({"http://example.com", 0});
+
+    pthread_t single_thread;
+    pthread_create(&single_thread, NULL, crawler_worker, NULL);
+
     sleep(5);
-    pthread_mutex_lock(&statsLock);
-    crawlActive = false;
-    pthread_mutex_unlock(&statsLock);
-    pthread_cond_broadcast(&queueCond);
-    pthread_join(st, NULL);
-    int pSingle = pagesCrawled;
 
-    // PHASE 2
-    cout << "\n--- Phase 2: Multi-Threaded Test (" << requestedThreads << " threads, 5s) ---" << endl;
-    resetCrawlerState(requestedThreads);
-    urlFrontier.push({"http://example.com", 0});
-    pthread_t mon; 
-    pthread_create(&mon, NULL, monitorWorker, NULL);
-    pthread_t mt[requestedThreads];
-    for(int i=0; i<requestedThreads; i++) pthread_create(&mt[i], NULL, crawlerWorker, NULL);
-    
-    sleep(5); // Run for 5 seconds
-    
-    pthread_mutex_lock(&statsLock);
-    crawlActive = false;
-    pthread_mutex_unlock(&statsLock);
-    pthread_cond_broadcast(&queueCond);
-    for(int i=0; i<requestedThreads; i++) pthread_join(mt[i], NULL);
-    pthread_join(mon, NULL);
+    pthread_mutex_lock(&stats_lock);
+    crawl_active = false;
+    pthread_mutex_unlock(&stats_lock);
 
-    auto endTime = chrono::steady_clock::now();
-    chrono::duration<double> totalElapsed = endTime - startTime;
+    pthread_cond_broadcast(&queue_cond);
 
-    // PERFORMANCE TABLE
+    pthread_join(single_thread, NULL);
+
+    int single_pages = pages_crawled;
+
+    cout << "\n--- Phase 2: Multi-Threaded Test ("
+         << requested_threads
+         << " threads, 5s) ---"
+         << endl;
+
+    reset_crawler(requested_threads);
+
+    url_queue.push({"http://example.com", 0});
+
+    pthread_t monitor_thread;
+    pthread_create(&monitor_thread, NULL, monitor_worker, NULL);
+
+    pthread_t worker_threads[requested_threads];
+
+    for (int i = 0; i < requested_threads; i++) {
+        pthread_create(&worker_threads[i],
+                       NULL,
+                       crawler_worker,
+                       NULL);
+    }
+
+    sleep(5);
+
+    pthread_mutex_lock(&stats_lock);
+    crawl_active = false;
+    pthread_mutex_unlock(&stats_lock);
+
+    pthread_cond_broadcast(&queue_cond);
+
+    for (int i = 0; i < requested_threads; i++) {
+        pthread_join(worker_threads[i], NULL);
+    }
+
+    pthread_join(monitor_thread, NULL);
+
+    auto end_time = chrono::steady_clock::now();
+    chrono::duration<double> total_time = end_time - start_time;
+
     cout << "\n\nFINAL PERFORMANCE TABLE" << endl;
     cout << "----------------------------------------" << endl;
-    cout << left << setw(20) << "Mode" << setw(10) << "Pages" << "Speedup" << endl;
-    cout << left << setw(20) << "Single-Thread" << setw(10) << pSingle << "1.00x" << endl;
-    double speedup = (pSingle == 0) ? 0 : (double)pagesCrawled / pSingle;
-    cout << left << setw(20) << "Multi-Thread" << setw(10) << pagesCrawled << fixed << setprecision(2) << speedup << "x" << endl;
+    cout << left << setw(20)
+         << "Mode"
+         << setw(10)
+         << "Pages"
+         << "Speedup"
+         << endl;
+
+    cout << left << setw(20)
+         << "Single-Thread"
+         << setw(10)
+         << single_pages
+         << "1.00x"
+         << endl;
+
+    double speedup =
+        (single_pages == 0)
+            ? 0
+            : (double)pages_crawled / single_pages;
+
+    cout << left << setw(20)
+         << "Multi-Thread"
+         << setw(10)
+         << pages_crawled
+         << fixed
+         << setprecision(2)
+         << speedup
+         << "x"
+         << endl;
+
     cout << "----------------------------------------" << endl;
 
-    // --- YOUR REQUESTED SUMMARY BLOCK ---
     cout << "\n--- FINAL CRAWLER SUMMARY ---" << endl;
-    cout << left << setw(25) << "Total Pages Crawled" << ": " << pagesCrawled << endl;
-    cout << left << setw(25) << "Unique URLs Found"    << ": " << urlsDiscovered << endl;
-    cout << left << setw(25) << "Keywords Indexed"     << ": " << keywordIndex.size() << endl;
-    cout << left << setw(25) << "Threads Used"         << ": " << requestedThreads << endl;
-    cout << left << setw(25) << "Time Elapsed"         << ": " << fixed << setprecision(2) << totalElapsed.count() << "s" << endl;
+    cout << left << setw(25)
+         << "Total Pages Crawled"
+         << ": "
+         << pages_crawled
+         << endl;
+
+    cout << left << setw(25)
+         << "Unique URLs Found"
+         << ": "
+         << urls_found
+         << endl;
+
+    cout << left << setw(25)
+         << "Keywords Indexed"
+         << ": "
+         << keyword_index.size()
+         << endl;
+
+    cout << left << setw(25)
+         << "Threads Used"
+         << ": "
+         << requested_threads
+         << endl;
+
+    cout << left << setw(25)
+         << "Time Elapsed"
+         << ": "
+         << fixed
+         << setprecision(2)
+         << total_time.count()
+         << "s"
+         << endl;
+
     cout << "----------------------------------------" << endl;
 
     curl_global_cleanup();
+
     return 0;
 }
